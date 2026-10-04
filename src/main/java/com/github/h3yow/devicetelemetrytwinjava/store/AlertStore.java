@@ -7,9 +7,10 @@ import com.github.h3yow.devicetelemetrytwinjava.domain.EvaluationRecord;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 告警状态存储：规则（带版本）、告警实体与只追加的判定历史。
@@ -21,14 +22,18 @@ import java.util.Map;
 @Component
 public class AlertStore {
 
-    /** ruleId -> 当前规则（版本最高） */
-    private final Map<String, AlertRule> rules = new HashMap<>();
+    /** ruleId -> 当前规则（版本最高）。并发读多写少（规则可在上报期间变更），用并发映射。 */
+    private final Map<String, AlertRule> rules = new ConcurrentHashMap<>();
     /** ruleId -> 该规则最近一条尚未 RESOLVED 的告警；恢复后清空，再次越限即产生新告警 */
-    private final Map<String, Alert> openAlertsByRule = new HashMap<>();
+    private final Map<String, Alert> openAlertsByRule = new ConcurrentHashMap<>();
     /** alertId -> 全部告警（含已恢复） */
-    private final Map<String, Alert> alertsById = new HashMap<>();
-    /** 只追加的判定历史 */
-    private final List<EvaluationRecord> history = new ArrayList<>();
+    private final Map<String, Alert> alertsById = new ConcurrentHashMap<>();
+    /**
+     * 只追加的判定历史。上报高并发写入、查询/试算并发遍历；用同步列表保证追加 O(1)，
+     * 对外读取统一先拷贝快照，遍历永不与追加互相干扰。
+     */
+    private final List<EvaluationRecord> history =
+            java.util.Collections.synchronizedList(new ArrayList<>());
 
     private long alertSequence;
 
@@ -45,19 +50,23 @@ public class AlertStore {
                              double threshold,
                              boolean enabled,
                              long now) {
-        AlertRule existing = rules.get(ruleId);
-        int version = existing == null ? 1 : existing.ruleVersion() + 1;
-        AlertRule rule = new AlertRule(ruleId, deviceId, metric, operator, threshold, version, now, enabled);
-        rules.put(ruleId, rule);
-        return rule;
+        // compute 原子完成“取当前版本 → +1 → 落库”，并发改规则也不会丢版本号
+        return rules.compute(ruleId, (id, existing) -> {
+            int version = existing == null ? 1 : existing.ruleVersion() + 1;
+            return new AlertRule(id, deviceId, metric, operator, threshold, version, now, enabled);
+        });
     }
 
     public AlertRule getRule(String ruleId) {
         return rules.get(ruleId);
     }
 
+    /** 返回设备规则的不可变列表；按 ruleId 排序，保证判定顺序与试算结果确定。 */
     public List<AlertRule> rulesForDevice(String deviceId) {
-        return rules.values().stream().filter(r -> r.deviceId().equals(deviceId)).toList();
+        return rules.values().stream()
+                .filter(r -> r.deviceId().equals(deviceId))
+                .sorted(Comparator.comparing(AlertRule::ruleId))
+                .toList();
     }
 
     public List<AlertRule> allRules() {
@@ -104,15 +113,22 @@ public class AlertStore {
         history.add(record);
     }
 
+    /** 原子拷贝一份历史快照，供过滤/遍历（追加与读取互不阻塞、不抛并发修改异常）。 */
+    private List<EvaluationRecord> historySnapshot() {
+        synchronized (history) {
+            return new ArrayList<>(history);
+        }
+    }
+
     public List<EvaluationRecord> historyForDevice(String deviceId) {
-        return history.stream().filter(r -> r.deviceId().equals(deviceId)).toList();
+        return historySnapshot().stream().filter(r -> r.deviceId().equals(deviceId)).toList();
     }
 
     public List<EvaluationRecord> historyForRule(String ruleId) {
-        return history.stream().filter(r -> r.ruleId().equals(ruleId)).toList();
+        return historySnapshot().stream().filter(r -> r.ruleId().equals(ruleId)).toList();
     }
 
     public List<EvaluationRecord> allHistory() {
-        return List.copyOf(history);
+        return historySnapshot();
     }
 }

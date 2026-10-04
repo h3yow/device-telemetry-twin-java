@@ -12,6 +12,7 @@ import com.github.h3yow.devicetelemetrytwinjava.store.AlertStore;
 import com.github.h3yow.devicetelemetrytwinjava.store.DeviceLocks;
 import com.github.h3yow.devicetelemetrytwinjava.store.DeviceRegistry;
 import com.github.h3yow.devicetelemetrytwinjava.store.ShadowStore;
+import com.github.h3yow.devicetelemetrytwinjava.store.TelemetryHistoryStore;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -48,7 +49,7 @@ class RuleChangeReproducibilityTest {
         DeviceLocks locks = new DeviceLocks();
         alertStore = new AlertStore();
         alertService = new AlertService(alertStore, registry, locks);
-        telemetryService = new TelemetryService(registry, shadowStore, locks, alertService, 5000, 60000);
+        telemetryService = new TelemetryService(registry, shadowStore, locks, alertService, new TelemetryHistoryStore(20000, 200000), 5000, 60000);
         registry.register(new Device(DEVICE, "规则变更设备",
                 Map.of("temperature", new Device.MetricBounds(-40, 85))));
         clock = 5_000_000L;

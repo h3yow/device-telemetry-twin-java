@@ -126,6 +126,56 @@ desired 写入返回 `ShadowUpdateResult{status, reason, desiredVersion}`：
 
 ---
 
+## 4b. 规则上线前的历史试算（What-if）
+
+改阈值 / 换算子 / 加规则之前，先用**最近的历史遥测**把候选规则试跑一遍，
+并与**当前生效规则**在同一时间窗口的结果对照，提前看清这次调整会多报还是少报。
+试算**完全只读**，绝不触碰线上影子、告警与判定历史。
+
+### 适用场景
+
+- 阈值调整（如 `temperature > 30` 改成 `> 40`）前评估告警量变化；
+- 新增规则、更换算子（`GT`→`GTE` 等）前看会在哪些时刻新触发；
+- 评估触发时刻、恢复时刻（持续时长）是否因规则调整而提前/推迟。
+
+### 历史留存范围（有界、确定）
+
+- 仅留存**被接入管道接受**的遥测（`ACCEPTED` / `DEGRADED`），且是**范围清洗之后**的指标载荷，
+  因此试算口径与线上判定完全一致；被拒绝、重复（`DUPLICATE`）、迟到（`STALE`）的上报**不留存**。
+- 容量上限可配（内存占用有明确上限），超限后按固定 **FIFO** 规则淘汰最旧数据：
+  - 每设备 `trial.history.max-points-per-device`（默认 20000）；
+  - 全局合计 `trial.history.max-total-points`（默认 200000），超限时在各设备最旧点中淘汰事件时间最早者。
+- 每台设备记录“已淘汰数据的最大事件时间”高水位，查询/试算用 `coverage` 明确区分三种情况：
+
+| coverage | 含义 |
+|---|---|
+| `COMPLETE` | 留存完整覆盖请求窗口（窗口里有数据，且不与淘汰区相交） |
+| `PARTIAL_EVICTED` | 窗口与已淘汰时间区间相交，部分历史已被淘汰，结果可能不完整 |
+| `NO_DATA` | 留存是完整的，但窗口内确实没有任何已接受遥测（自然也没有告警） |
+
+### 规则版本与兼容
+
+- 试算入参是一份**完整候选规则集**（`TrialRule`，含尚未生效的阈值/算子/启用状态）：
+  与当前规则 `ruleId` 相同视为“修改”，否则视为“新增”；候选集里没有的当前规则视为“删除”。
+- 候选规则**不会**写入线上规则库，也不占用线上版本号。试算内部为其分配确定版本：
+  修改的规则取“当前版本 + 1”，新增规则取 `0`（试算初版），仅用于结果标注与差异复核。
+- 同一批历史 + 同一份候选规则，重复试算**结果逐字节一致**（不使用当前时钟、随机数、锁顺序）。
+
+### 试算结果与差异
+
+- `baseline`：当前生效规则在同一窗口的确定性回放；`candidate`：候选规则回放。
+  每侧都给出 `episodes`（完整告警段：触发时刻、触发输入值、段内峰值、恢复时刻、持续时长）。
+- `diffs` 三类：
+  - `NEW`：候选下新多出来的告警段；
+  - `REMOVED`：当前会报、候选下不报了；
+  - `CHANGED`：两侧都报，但触发时刻或恢复时刻/持续时长变了。
+- 每条差异都带 `baselineVersion / candidateVersion` 与两侧告警段（含**输入值与时刻**），可直接复核
+  “是基于哪版规则、由哪些输入值算出来的”。
+- 说明：试算从“窗口起点无未决告警”的固定初始状态回放，回答的是“**规则本身**在这段历史上会报什么”；
+  线上的人工**抑制（suppress）**是运维动作，不纳入试算状态机。
+
+---
+
 ## 5. HTTP 接口
 
 | 方法 | 路径 | 说明 |
@@ -141,6 +191,8 @@ desired 写入返回 `ShadowUpdateResult{status, reason, desiredVersion}`：
 | GET | `/api/alerts/devices/{deviceId}` | 查设备全部告警 |
 | GET | `/api/alerts/history/devices/{deviceId}` | 设备判定历史 |
 | GET | `/api/alerts/history/rules/{ruleId}` | 规则判定历史（可复现） |
+| POST | `/api/trials/what-if` | 规则试算：候选规则在历史窗口回放并与当前规则对照（只读） |
+| GET | `/api/trials/history/{deviceId}?fromTs=&toTs=` | 查询留存的原始遥测与覆盖/淘汰边界（只读） |
 | POST | `/api/simulator/tick` | 推进一次温度振荡周期 |
 | POST | `/api/simulator/produce` | 产生一条指定温度上报 |
 | POST | `/api/simulator/arbitrary` | 产生任意 seq/ts 上报（乱序/迟到演示） |
@@ -153,13 +205,13 @@ desired 写入返回 `ShadowUpdateResult{status, reason, desiredVersion}`：
 
 ## 6. 本地验证
 
-### 6.1 运行测试（乱序/重复/并发/规则变更全覆盖）
+### 6.1 运行测试（乱序/重复/并发/规则变更/历史试算全覆盖）
 
 ```bash
 mvn test
 ```
 
-14 个用例，测试日志会打印**输入与判定依据**，例如：
+25 个用例，测试日志会打印**输入与判定依据**，例如：
 
 ```
 [输入] seq=11 ts偏移=10ms metrics={temperature=21.0} -> [结论] status=ACCEPTED version=2 ...
@@ -176,6 +228,10 @@ mvn test
 | `AlertLifecycleTest` | 触发/持续/恢复、抑制/窗口到期自动恢复、停用、指标缺失 |
 | `AlertConcurrencyTest` | 16 线程并发越限：单告警、无重复、无漏报、历史自洽 |
 | `RuleChangeReproducibilityTest` | 阈值 30→40 版本化变更、历史按 v1/v2 复现、停用后重启用 |
+| `RuleTrialDiffTest` | 试算差异 NEW/REMOVED/CHANGED 正确、重复试算逐字段一致（可复现）、试算只读不改动线上 |
+| `TelemetryRetentionTest` | 有界留存 FIFO 淘汰、`COMPLETE/PARTIAL_EVICTED/NO_DATA` 区分、被拒/重复/迟到不留存 |
+| `TrialConcurrencyTest` | 8 上报线程×2 设备 + 1000 规则反复改版 + 4 试算线程并发：不报错、不丢不重、版本递增 |
+| `TrialApiIntegrationTest` | 经 MockMvc 验证试算与历史查询 HTTP 链路、差异内容、非法入参/未知设备 400 |
 | `EndToEndIntegrationTest` | 经 MockMvc HTTP 走完整链路并断言各入口结论一致 |
 
 ### 6.2 启动服务并手工演练
@@ -214,6 +270,16 @@ curl -s -X PUT localhost:8080/api/alerts/rules -H 'Content-Type: application/jso
   "ruleId":"rule-temp-high","deviceId":"sim-thermo-001",
   "metric":"temperature","operator":"GT","threshold":40.0,"enabled":true}'
 curl -s localhost:8080/api/alerts/history/rules/rule-temp-high
+
+# 7) 规则上线前历史试算（不改线上）：候选把阈值放宽到 40，
+#    返回 baseline/candidate 两侧告警段与 diffs（NEW/REMOVED/CHANGED）及 coverage
+curl -s -X POST localhost:8080/api/trials/what-if -H 'Content-Type: application/json' -d '{
+  "deviceId":"sim-thermo-001","fromTs":1700000000000,"toTs":1700000099000,
+  "rules":[{"ruleId":"rule-temp-high","deviceId":"sim-thermo-001",
+            "metric":"temperature","operator":"GT","threshold":40.0,"enabled":true}]}'
+
+# 8) 只查留存的原始遥测（含 coverage 与 evictedHighTs 淘汰边界）
+curl -s 'localhost:8080/api/trials/history/sim-thermo-001?fromTs=1700000000000&toTs=1700000099000'
 ```
 
 ---
@@ -222,8 +288,13 @@ curl -s localhost:8080/api/alerts/history/rules/rule-temp-high
 
 ```
 domain/    领域类型：上报、影子快照、规则、告警实体、评估记录、各类结论枚举
+           试算类型：TrialRule（候选规则）、TrialEpisode（试算告警段）、TrialRun、
+                     EpisodeDiff（差异）、WhatIfResult、TrialCoverage、TelemetryHistoryWindow
 store/     DeviceRegistry、ShadowStore、AlertStore、DeviceLocks（全部进程内、线程安全）
-service/   TelemetryService（接入管道）、ShadowService（desired/读取）、AlertService（状态机）
+           TelemetryHistoryStore：有界原始遥测留存（每设备 + 全局容量、FIFO 淘汰、淘汰高水位）
+service/   TelemetryService（接入管道，接受后在设备锁内留存历史）、ShadowService（desired/读取）、
+           AlertService（线上状态机）、TrialService（试算编排：快照→双侧回放→差异对照）、
+           TrialEngine（确定性、无副作用的本地回放状态机）
 simulator/ DeviceSimulator（数据模拟）、BootSeeder（启动播种）
-web/       REST 控制器与全局异常处理
+web/       REST 控制器与全局异常处理（含 TrialController 试算入口）
 ```

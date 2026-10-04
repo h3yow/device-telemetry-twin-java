@@ -8,6 +8,7 @@ import com.github.h3yow.devicetelemetrytwinjava.domain.TelemetryReport;
 import com.github.h3yow.devicetelemetrytwinjava.store.DeviceLocks;
 import com.github.h3yow.devicetelemetrytwinjava.store.DeviceRegistry;
 import com.github.h3yow.devicetelemetrytwinjava.store.ShadowStore;
+import com.github.h3yow.devicetelemetrytwinjava.store.TelemetryHistoryStore;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -39,6 +40,7 @@ public class TelemetryService {
     private final ShadowStore shadowStore;
     private final DeviceLocks deviceLocks;
     private final AlertService alertService;
+    private final TelemetryHistoryStore historyStore;
 
     /** 事件时间晚于“已接受最新事件时间”多少毫秒仍允许接收（迟到容忍窗口）。 */
     private final long lateToleranceMillis;
@@ -49,12 +51,14 @@ public class TelemetryService {
                             ShadowStore shadowStore,
                             DeviceLocks deviceLocks,
                             AlertService alertService,
+                            TelemetryHistoryStore historyStore,
                             @Value("${telemetry.late-tolerance-millis:5000}") long lateToleranceMillis,
                             @Value("${telemetry.future-skew-millis:60000}") long futureSkewMillis) {
         this.deviceRegistry = deviceRegistry;
         this.shadowStore = shadowStore;
         this.deviceLocks = deviceLocks;
         this.alertService = alertService;
+        this.historyStore = historyStore;
         this.lateToleranceMillis = lateToleranceMillis;
         this.futureSkewMillis = futureSkewMillis;
     }
@@ -143,6 +147,10 @@ public class TelemetryService {
                     effectiveSeq, report.ts(), report.receivedAt());
             List<EvaluationRecord> evaluations = alertService.evaluate(
                     report.deviceId(), cleaned, report.receivedAt());
+            // 留存用于规则试算的原始遥测：仅被接受（含降级）、指标已清洗的上报；
+            // 被拒/重复/迟到的不进留存。使用清洗后的载荷，保证试算口径与线上判定一致。
+            historyStore.append(new TelemetryReport(report.deviceId(), effectiveSeq,
+                    report.ts(), cleaned, report.receivedAt()));
 
             IngestStatus status = dropped.isEmpty() ? IngestStatus.ACCEPTED : IngestStatus.DEGRADED;
             String reason = dropped.isEmpty()
