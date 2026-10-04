@@ -126,7 +126,66 @@ desired 写入返回 `ShadowUpdateResult{status, reason, desiredVersion}`：
 
 ---
 
-## 5. HTTP 接口
+## 5. 规则试算（历史回放 + 差异对照）
+
+**适用场景**：改阈值、改算子或新增规则之前，先拿最近一段时间的真实遥测试跑一遍，
+量化这次调整的影响——会多报哪些、少报哪些、哪些告警的触发时刻/持续时长会变——
+确认符合预期后再正式上线，避免线上才发现问题。
+
+### 数据链路
+
+```
+遥测接入（ACCEPTED/DEGRADED，清洗后的指标）
+   └─ 同一设备锁内追加 ──> TelemetryHistoryStore（按设备留存，有界）
+POST /api/replay（设备 + 时间窗口 + 候选规则）
+   └─ ReplayService：只读历史做纯函数回放 ──> 候选告警片段
+   └─ 与同窗口线上告警对照 ──> ADDED / REMOVED / CHANGED 差异列表
+```
+
+### 留存范围与内存上限
+
+- 只留存**被平台接受**（`ACCEPTED` / `DEGRADED`）的遥测点，且指标为清洗后的值，
+  保证回放输入与线上判定输入完全一致；被拒绝/重复/迟到的数据不留存。
+- 内存占用有明确上限，两级约束，超限按**最旧先淘汰**的固定规则驱逐：
+  - `telemetry.history.max-points-per-device`（默认 50000）：单设备留存点数上限；
+  - `telemetry.history.max-total-points`（默认 500000）：全局留存点数上限。
+- 查询结果用 `coverage` 字段区分“历史已被淘汰”与“确实没有数据/告警”
+  （按每设备“被淘汰点的最大接收时间”判定，而非简单地看窗口起点是否早于最早留存点——
+  窗口起点早于设备开始有数据的时间并不算淘汰）：
+  - `FULL`：窗口未与已淘汰区域重叠，窗口内历史完整可查，零告警即“确实没有告警”；
+  - `PARTIAL_EVICTED`：窗口与已淘汰区域重叠，更早的历史已淘汰，结论仅覆盖仍留存的部分；
+  - `EMPTY`：该设备当前没有任何留存历史，且窗口未与已淘汰区域重叠。
+
+### 试算语义与兼容范围
+
+- 候选规则（`ReplayRuleSpec`）与线上 `AlertRule` 使用**同一套算子与阈值语义**，
+  可以携带尚未生效的阈值/算子；候选规则不写入规则存储，不影响线上。
+- 判定时刻取历史点的平台接收时间，与线上 `AlertService` 的触发/恢复状态机语义一致；
+  缺指标的历史点不驱动状态机（同线上 `METRIC_ABSENT`）。
+- 试算**不建模人工抑制**：抑制是运维动作，无法从历史数据复现；
+  线上告警若曾被抑制，对照时按其真实触发/恢复时刻参与比较。
+- 试算为**纯函数**：不依赖外部时钟与可变状态，同一批历史 + 同一份候选规则，
+  重复试算结果完全一致；全程只读，不改动影子、告警与判定历史，
+  仅在拷贝线上告警快照的瞬间持有设备锁，回放计算在锁外进行，不阻塞线上接入。
+- 每条差异都携带：线上规则版本（`liveRuleVersion`）、两侧触发/恢复时刻与输入值、
+  以及人类可读的 `detail` 说明，便于复核“基于哪版规则、由哪些输入算出来的”。
+
+### 请求示例
+
+```bash
+curl -s -X POST localhost:8080/api/replay -H 'Content-Type: application/json' -d '{
+  "deviceId":"sim-thermo-001","fromTs":0,"toTs":9999999999999,
+  "rules":[{"ruleId":"rule-temp-high","metric":"temperature","operator":"GT",
+            "threshold":35.0,"enabled":true}]}'
+```
+
+响应要点：`candidateAlerts`（候选规则会触发的告警片段）、`liveAlertsInWindow`
+（同窗口线上告警）、`diffs`（`ADDED` 多报 / `REMOVED` 少报 / `CHANGED` 时序变化）、
+`coverage`（历史覆盖情况）、`pointsReplayed`（参与回放的历史点数）。
+
+---
+
+## 6. HTTP 接口
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -141,6 +200,7 @@ desired 写入返回 `ShadowUpdateResult{status, reason, desiredVersion}`：
 | GET | `/api/alerts/devices/{deviceId}` | 查设备全部告警 |
 | GET | `/api/alerts/history/devices/{deviceId}` | 设备判定历史 |
 | GET | `/api/alerts/history/rules/{ruleId}` | 规则判定历史（可复现） |
+| POST | `/api/replay` | 规则试算：历史回放 + 与线上结果差异对照 |
 | POST | `/api/simulator/tick` | 推进一次温度振荡周期 |
 | POST | `/api/simulator/produce` | 产生一条指定温度上报 |
 | POST | `/api/simulator/arbitrary` | 产生任意 seq/ts 上报（乱序/迟到演示） |
@@ -151,15 +211,15 @@ desired 写入返回 `ShadowUpdateResult{status, reason, desiredVersion}`：
 
 ---
 
-## 6. 本地验证
+## 7. 本地验证
 
-### 6.1 运行测试（乱序/重复/并发/规则变更全覆盖）
+### 7.1 运行测试（乱序/重复/并发/规则变更全覆盖）
 
 ```bash
 mvn test
 ```
 
-14 个用例，测试日志会打印**输入与判定依据**，例如：
+22 个用例，测试日志会打印**输入与判定依据**，例如：
 
 ```
 [输入] seq=11 ts偏移=10ms metrics={temperature=21.0} -> [结论] status=ACCEPTED version=2 ...
@@ -177,8 +237,11 @@ mvn test
 | `AlertConcurrencyTest` | 16 线程并发越限：单告警、无重复、无漏报、历史自洽 |
 | `RuleChangeReproducibilityTest` | 阈值 30→40 版本化变更、历史按 v1/v2 复现、停用后重启用 |
 | `EndToEndIntegrationTest` | 经 MockMvc HTTP 走完整链路并断言各入口结论一致 |
+| `TelemetryHistoryStoreTest` | 历史留存：每设备/全局上限、最旧先淘汰、窗口查询有序 |
+| `ReplayServiceTest` | 试算差异内容（ADDED/REMOVED/CHANGED 带版本与输入值）、结果可复现、试算只读不伤线上、淘汰与无数据可区分 |
+| `ReplayConcurrencyTest` | 多设备并发上报 + 期间改规则 + 反复试算：不丢判定、无重复告警、试算无异常、输入稳定后可复现 |
 
-### 6.2 启动服务并手工演练
+### 7.2 启动服务并手工演练
 
 ```bash
 mvn spring-boot:run
@@ -214,16 +277,22 @@ curl -s -X PUT localhost:8080/api/alerts/rules -H 'Content-Type: application/jso
   "ruleId":"rule-temp-high","deviceId":"sim-thermo-001",
   "metric":"temperature","operator":"GT","threshold":40.0,"enabled":true}'
 curl -s localhost:8080/api/alerts/history/rules/rule-temp-high
+
+# 7) 规则试算：用候选阈值 35 对全部留存历史回放，并与线上结果对照
+curl -s -X POST localhost:8080/api/replay -H 'Content-Type: application/json' -d '{
+  "deviceId":"sim-thermo-001","fromTs":0,"toTs":9999999999999,
+  "rules":[{"ruleId":"rule-temp-high","metric":"temperature","operator":"GT",
+            "threshold":35.0,"enabled":true}]}'
 ```
 
 ---
 
-## 7. 代码结构
+## 8. 代码结构
 
 ```
-domain/    领域类型：上报、影子快照、规则、告警实体、评估记录、各类结论枚举
-store/     DeviceRegistry、ShadowStore、AlertStore、DeviceLocks（全部进程内、线程安全）
-service/   TelemetryService（接入管道）、ShadowService（desired/读取）、AlertService（状态机）
+domain/    领域类型：上报、影子快照、规则、告警实体、评估记录、历史点、试算结果/差异、各类结论枚举
+store/     DeviceRegistry、ShadowStore、AlertStore、TelemetryHistoryStore、DeviceLocks（全部进程内、线程安全）
+service/   TelemetryService（接入管道）、ShadowService（desired/读取）、AlertService（状态机）、ReplayService（规则试算）
 simulator/ DeviceSimulator（数据模拟）、BootSeeder（启动播种）
 web/       REST 控制器与全局异常处理
 ```

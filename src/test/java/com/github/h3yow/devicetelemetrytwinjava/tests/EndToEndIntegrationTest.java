@@ -119,6 +119,26 @@ class EndToEndIntegrationTest {
                 .andExpect(jsonPath("$.reported.temperature").value(20.0))
                 .andExpect(jsonPath("$.desired.targetTemp").value(20.0))
                 .andExpect(jsonPath("$.reportedVersion").value(2));
+
+        // 规则试算：候选阈值 45（高于历史峰值 40）应得出 REMOVED（少报）差异，
+        // 且试算不影响线上判定历史（仍为 2 条）
+        String replayResp = mockMvc.perform(post("/api/replay")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"deviceId":"sim-thermo-002","fromTs":0,"toTs":9999999999999,
+                                 "rules":[{"ruleId":"e2e-rule","metric":"temperature",
+                                           "operator":"GT","threshold":45.0,"enabled":true}]}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.coverage").value("FULL"))
+                .andExpect(jsonPath("$.pointsReplayed").value(2))
+                .andExpect(jsonPath("$.diffs[0].type").value("REMOVED"))
+                .andExpect(jsonPath("$.diffs[0].liveRuleVersion").value(1))
+                .andReturn().getResponse().getContentAsString();
+        log.info("[HTTP 试算] {}", replayResp);
+        mockMvc.perform(get("/api/alerts/history/rules/e2e-rule"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(2));
         log.info("[端到端链路验证通过]");
     }
 

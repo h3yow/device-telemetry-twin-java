@@ -12,6 +12,7 @@ import com.github.h3yow.devicetelemetrytwinjava.store.AlertStore;
 import com.github.h3yow.devicetelemetrytwinjava.store.DeviceLocks;
 import com.github.h3yow.devicetelemetrytwinjava.store.DeviceRegistry;
 import com.github.h3yow.devicetelemetrytwinjava.store.ShadowStore;
+import com.github.h3yow.devicetelemetrytwinjava.store.TelemetryHistoryStore;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -52,7 +53,7 @@ class ShadowConsistencyTest {
         AlertStore alertStore = new AlertStore();
         AlertService alertService = new AlertService(alertStore, registry, locks);
         shadowService = new ShadowService(shadowStore, registry, locks);
-        telemetryService = new TelemetryService(registry, shadowStore, locks, alertService, 5000, 60000);
+        telemetryService = new TelemetryService(registry, shadowStore, locks, alertService, new TelemetryHistoryStore(50000, 500000), 5000, 60000);
         registry.register(new Device(DEVICE, "影子测试设备", Map.of()));
     }
 

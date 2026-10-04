@@ -7,6 +7,7 @@ import org.springframework.stereotype.Component;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 设备影子存储。
@@ -23,7 +24,8 @@ import java.util.Map;
 @Component
 public class ShadowStore {
 
-    private final Map<String, MutableShadow> shadows = new HashMap<>();
+    /** deviceId -> 影子。锁粒度是每设备一把，但本表跨设备共享，必须用并发容器。 */
+    private final Map<String, MutableShadow> shadows = new ConcurrentHashMap<>();
 
     private MutableShadow internal(String deviceId) {
         return shadows.computeIfAbsent(deviceId, MutableShadow::new);

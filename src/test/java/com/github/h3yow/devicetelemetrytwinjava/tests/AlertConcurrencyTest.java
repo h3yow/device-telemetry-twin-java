@@ -12,6 +12,7 @@ import com.github.h3yow.devicetelemetrytwinjava.store.AlertStore;
 import com.github.h3yow.devicetelemetrytwinjava.store.DeviceLocks;
 import com.github.h3yow.devicetelemetrytwinjava.store.DeviceRegistry;
 import com.github.h3yow.devicetelemetrytwinjava.store.ShadowStore;
+import com.github.h3yow.devicetelemetrytwinjava.store.TelemetryHistoryStore;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -43,7 +44,7 @@ class AlertConcurrencyTest {
         AlertStore alertStore = new AlertStore();
         AlertService alertService = new AlertService(alertStore, registry, locks);
         TelemetryService telemetryService = new TelemetryService(
-                registry, shadowStore, locks, alertService, 5000, 60000);
+                registry, shadowStore, locks, alertService, new TelemetryHistoryStore(50000, 500000), 5000, 60000);
         String device = "dev-conc-alert";
         registry.register(new Device(device, "并发告警设备",
                 Map.of("temperature", new Device.MetricBounds(-40, 85))));
